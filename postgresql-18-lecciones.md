@@ -14,8 +14,8 @@ Edición: noviembre de 2026
 
 # Índice temático
 
-Actualización incluida: lecciones 30-37 sobre concurrencia, bloqueos,
-eventos, serialización, seguridad avanzada y observabilidad. La
+Actualización incluida: lecciones 30-38 sobre concurrencia, bloqueos,
+eventos, serialización, seguridad avanzada, observabilidad y mantenimiento. La
 numeración 20 no aparece en el historial disponible y no se inventa.
 
 **Arquitectura, administración y monitorización**
@@ -114,6 +114,30 @@ numeración 20 no aparece en el historial disponible y no se inventa.
 >
 > [<u>Lección 28: Búsqueda aproximada con
 > pg_trgm</u>](#lección-28-búsqueda-aproximada-con-pg_trgm)
+
+**Concurrencia, bloqueos y eventos**
+
+> [<u>Lección 30: Colas de trabajo con FOR UPDATE SKIP LOCKED</u>](#lección-30-colas-de-trabajo-con-for-update-skip-locked)
+>
+> [<u>Lección 31: Diagnóstico de bloqueos con pg_stat_activity y pg_locks</u>](#lección-31-diagnóstico-de-bloqueos-con-pg_stat_activity-y-pg_locks)
+>
+> [<u>Lección 32: Avisos en tiempo real con LISTEN, NOTIFY y triggers</u>](#lección-32-avisos-en-tiempo-real-con-listen-notify-y-triggers)
+>
+> [<u>Lección 33: Patrón transactional outbox</u>](#lección-33-patrón-transactional-outbox)
+>
+> [<u>Lección 34: Aislamiento SERIALIZABLE y reintentos</u>](#lección-34-aislamiento-serializable-y-reintentos)
+
+**Seguridad avanzada y APIs de base de datos**
+
+> [<u>Lección 35: API segura con SECURITY DEFINER</u>](#lección-35-api-segura-con-security-definer)
+
+**Observabilidad y rendimiento avanzado**
+
+> [<u>Lección 36: Memoria de planificación y ejecución con EXPLAIN</u>](#lección-36-memoria-de-planificación-y-ejecución-con-explain)
+>
+> [<u>Lección 37: Encontrar consultas costosas con pg_stat_statements</u>](#lección-37-encontrar-consultas-costosas-con-pg_stat_statements)
+>
+> [<u>Lección 38: Medir ANALYZE y detectar estadísticas desactualizadas</u>](#lección-38-medir-analyze-y-detectar-estadísticas-desactualizadas)
 
 # Arquitectura, administración y monitorización
 
@@ -1996,6 +2020,134 @@ pg_stat_statements ya existía. PostgreSQL 18 añade métricas como
 parallel_workers_to_launch, parallel_workers_launched y
 wal_buffers_full, y mejora el seguimiento de varias clases de
 sentencias.
+
+## Lección 38 · Medir ANALYZE y detectar estadísticas desactualizadas
+
+[<u>↑ Volver al índice</u>](#índice-temático)
+
+### Idea principal
+
+El planificador decide entre escaneos, índices y métodos de JOIN usando
+estadísticas sobre el número y la distribución de filas. `ANALYZE` las
+actualiza; el autovacuum también puede ejecutar `AUTOANALYZE`. La vista
+`pg_stat_user_tables` permite comprobar cuándo ocurrió, cuántas veces y,
+desde PostgreSQL 18, cuánto tiempo acumulado consumió.
+
+### Datos mínimos y ejemplo ejecutable
+
+```sql
+DROP TABLE IF EXISTS l38_productos;
+
+CREATE TABLE l38_productos (
+    producto_id integer PRIMARY KEY,
+    nombre      text NOT NULL,
+    precio      numeric(10,2) NOT NULL,
+    stock       integer NOT NULL
+);
+
+INSERT INTO l38_productos VALUES
+    (1, 'Portátil', 899.00, 4),
+    (2, 'Monitor',  249.00, 8),
+    (3, 'Teclado',   79.00, 15),
+    (4, 'Ratón',      39.00, 20);
+
+ANALYZE l38_productos;
+SELECT pg_stat_clear_snapshot();
+
+SELECT relname,
+       n_live_tup,
+       analyze_count >= 1 AS analizada,
+       total_analyze_time >= 0 AS tiempo_registrado
+FROM pg_stat_user_tables
+WHERE relname = 'l38_productos';
+```
+
+### Resultado esperado
+
+| relname | n_live_tup | analizada | tiempo_registrado |
+|---|---:|---|---|
+| l38_productos | 4 | true | true |
+
+El tiempo exacto no es fijo: depende del servidor. `pg_stat_clear_snapshot()`
+evita reutilizar dentro de la transacción una instantánea anterior de las
+estadísticas acumuladas.
+
+### Ejercicio práctico
+
+Inserta dos productos sin ejecutar `ANALYZE`. Comprueba primero la estimación
+guardada en `pg_class`, actualiza las estadísticas y vuelve a comprobarla.
+
+```sql
+INSERT INTO l38_productos VALUES
+    (5, 'Webcam',   99.00, 6),
+    (6, 'Auriculares', 129.00, 10);
+
+SELECT reltuples::bigint AS filas_estimadas
+FROM pg_class
+WHERE oid = 'l38_productos'::regclass;
+```
+
+Antes de analizar, el resultado esperado es `4`: las dos filas existen, pero
+la estimación del catálogo todavía procede del análisis anterior.
+
+### Solución explicada paso a paso
+
+1. Actualiza las estadísticas de la tabla.
+
+```sql
+ANALYZE l38_productos;
+```
+
+2. Comprueba la nueva estimación.
+
+```sql
+SELECT reltuples::bigint AS filas_estimadas
+FROM pg_class
+WHERE oid = 'l38_productos'::regclass;
+```
+
+Resultado esperado: `6`.
+
+3. Comprueba que hubo al menos dos análisis manuales y que el tiempo acumulado
+es un valor no negativo.
+
+```sql
+SELECT n_live_tup,
+       analyze_count >= 2 AS dos_analisis,
+       ROUND(total_analyze_time::numeric, 3) AS total_analyze_ms
+FROM pg_stat_user_tables
+WHERE relname = 'l38_productos';
+```
+
+Resultado comprobable: `n_live_tup = 6` y `dos_analisis = true`. El valor de
+`total_analyze_ms` varía, pero nunca debe ser negativo.
+
+Para inspeccionar el trabajo realizado puedes ejecutar también:
+
+```sql
+ANALYZE (VERBOSE) l38_productos;
+```
+
+### Buena práctica
+
+No ejecutes `ANALYZE` continuamente por calendario sin observar la carga.
+Revisa `last_analyze`, `last_autoanalyze`, sus contadores y los cambios reales
+de datos. Si el autovacuum mantiene estadísticas recientes, un análisis manual
+puede ser innecesario.
+
+### PostgreSQL 18: novedad frente a concepto existente
+
+- `ANALYZE`, `pg_class.reltuples`, `last_analyze` y los contadores ya existían.
+- PostgreSQL 18 añade `total_vacuum_time`, `total_autovacuum_time`,
+  `total_analyze_time` y `total_autoanalyze_time` a `pg_stat_all_tables` y sus
+  variantes.
+- PostgreSQL 18 amplía `ANALYZE (VERBOSE)` con estadísticas de WAL, CPU y
+  lectura media. El tiempo de retraso por coste requiere
+  `track_cost_delay_timing`.
+
+Documentación oficial: [ANALYZE](https://www.postgresql.org/docs/18/sql-analyze.html),
+[estadísticas acumuladas](https://www.postgresql.org/docs/18/monitoring-stats.html)
+y [notas de PostgreSQL 18](https://www.postgresql.org/docs/18/release-18.html).
 
 # Mantenimiento de esta guía
 
