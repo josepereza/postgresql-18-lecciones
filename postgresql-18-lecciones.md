@@ -14,7 +14,7 @@ Edición: noviembre de 2026
 
 # Índice temático
 
-Actualización incluida: lecciones 30-38 sobre concurrencia, bloqueos,
+Actualización incluida: lecciones 30-39 sobre concurrencia, bloqueos,
 eventos, serialización, seguridad avanzada, observabilidad y mantenimiento. La
 numeración 20 no aparece en el historial disponible y no se inventa.
 
@@ -138,6 +138,8 @@ numeración 20 no aparece en el historial disponible y no se inventa.
 > [<u>Lección 37: Encontrar consultas costosas con pg_stat_statements</u>](#lección-37-encontrar-consultas-costosas-con-pg_stat_statements)
 >
 > [<u>Lección 38: Medir ANALYZE y detectar estadísticas desactualizadas</u>](#lección-38-medir-analyze-y-detectar-estadísticas-desactualizadas)
+>
+> [<u>Lección 39: E/S por sesión con pg_stat_get_backend_io()</u>](#lección-39-es-por-sesión-con-pg_stat_get_backend_io)
 
 # Arquitectura, administración y monitorización
 
@@ -2147,6 +2149,146 @@ puede ser innecesario.
 
 Documentación oficial: [ANALYZE](https://www.postgresql.org/docs/18/sql-analyze.html),
 [estadísticas acumuladas](https://www.postgresql.org/docs/18/monitoring-stats.html)
+y [notas de PostgreSQL 18](https://www.postgresql.org/docs/18/release-18.html).
+
+## Lección 39 · E/S por sesión con pg_stat_get_backend_io()
+
+[<u>↑ Volver al índice</u>](#índice-temático)
+
+### Idea principal
+
+`pg_stat_io` muestra actividad de entrada/salida agregada por tipo de proceso.
+PostgreSQL 18 añade `pg_stat_get_backend_io(pid)`, que permite observar cuánto
+lee, escribe, amplía o encuentra en caché una sesión concreta. Es útil para
+distinguir una consulta lenta por CPU de otra que mueve muchos datos.
+
+### Datos mínimos y ejemplo ejecutable
+
+```sql
+DROP TABLE IF EXISTS l39_productos;
+
+CREATE TABLE l39_productos (
+    producto_id integer PRIMARY KEY,
+    nombre      text NOT NULL,
+    precio      numeric(10,2) NOT NULL,
+    stock       integer NOT NULL
+);
+
+INSERT INTO l39_productos
+SELECT n,
+       'Producto ' || n,
+       (20 + n % 500)::numeric(10,2),
+       n % 50
+FROM generate_series(1, 5000) AS g(n);
+
+ANALYZE l39_productos;
+SELECT pg_backend_pid() AS mi_pid;
+
+SELECT backend_type,
+       object,
+       context,
+       reads,
+       read_bytes,
+       writes,
+       write_bytes,
+       hits
+FROM pg_stat_get_backend_io(pg_backend_pid())
+WHERE object = 'relation'
+  AND context = 'normal';
+```
+
+### Resultado esperado
+
+Debe aparecer una fila semejante a esta; los números dependen de la sesión:
+
+| backend_type | object | context | reads | read_bytes | writes | write_bytes | hits |
+|---|---|---|---:|---:|---:|---:|---:|
+| client backend | relation | normal | valor ≥ 0 | valor ≥ 0 | valor ≥ 0 | valor ≥ 0 | valor ≥ 0 |
+
+Comprueba de forma determinista que la función devuelve contadores válidos:
+
+```sql
+SELECT COUNT(*) > 0 AS hay_estadisticas,
+       bool_and(COALESCE(reads, 0) >= 0
+            AND COALESCE(read_bytes, 0) >= 0
+            AND COALESCE(writes, 0) >= 0
+            AND COALESCE(write_bytes, 0) >= 0) AS contadores_validos
+FROM pg_stat_get_backend_io(pg_backend_pid());
+```
+
+Resultado esperado:
+
+| hay_estadisticas | contadores_validos |
+|---|---|
+| true | true |
+
+### Ejercicio práctico
+
+Guarda una fotografía de los contadores, recorre toda la tabla y comprueba si
+aumentaron las lecturas o los aciertos de caché de la sesión.
+
+### Solución explicada paso a paso
+
+1. Guarda los valores actuales en una tabla temporal.
+
+```sql
+DROP TABLE IF EXISTS l39_io_antes;
+
+CREATE TEMP TABLE l39_io_antes AS
+SELECT object, context, reads, read_bytes, hits
+FROM pg_stat_get_backend_io(pg_backend_pid());
+```
+
+2. Ejecuta una consulta que recorra los productos.
+
+```sql
+SELECT SUM(stock) AS stock_total
+FROM l39_productos;
+```
+
+Resultado esperado: `122500`.
+
+3. Compara la fotografía con los contadores nuevos.
+
+```sql
+WITH ahora AS (
+    SELECT object, context, reads, read_bytes, hits
+    FROM pg_stat_get_backend_io(pg_backend_pid())
+)
+SELECT COALESCE(SUM(GREATEST(a.reads - b.reads, 0)), 0) AS lecturas_nuevas,
+       COALESCE(SUM(GREATEST(a.read_bytes - b.read_bytes, 0)), 0) AS bytes_nuevos,
+       COALESCE(SUM(GREATEST(a.hits - b.hits, 0)), 0) AS hits_nuevos,
+       COALESCE(SUM(GREATEST(a.reads - b.reads, 0)
+                          + GREATEST(a.hits - b.hits, 0)), 0) > 0
+           AS hubo_actividad
+FROM ahora a
+JOIN l39_io_antes b USING (object, context)
+WHERE a.object = 'relation'
+  AND a.context = 'normal';
+```
+
+Resultado comprobable: `hubo_actividad = true`. Si los bloques ya estaban en
+memoria, pueden aumentar los `hits` y quedar `lecturas_nuevas = 0`; eso no es
+un error, sino una lectura satisfecha por la caché compartida.
+
+### Buena práctica
+
+No interpretes `reads = 0` como «la consulta no leyó nada». Revisa también
+`hits`. Para medir tiempos de espera de E/S activa `track_io_timing` solo tras
+evaluar su pequeño coste de medición. No reinicies estadísticas globales en un
+servidor de producción solo para hacer una prueba.
+
+### PostgreSQL 18: novedad frente a concepto existente
+
+- `pg_stat_io` y `pg_backend_pid()` ya existían.
+- PostgreSQL 18 incorpora `pg_stat_get_backend_io(integer)` y
+  `pg_stat_reset_backend_stats(integer)` para consultar o reiniciar estadísticas
+  de un proceso concreto; el reinicio requiere privilegios elevados por defecto.
+- PostgreSQL 18 añade a las estadísticas de E/S los contadores en bytes
+  `read_bytes`, `write_bytes` y `extend_bytes`.
+
+Documentación oficial: [sistema de estadísticas acumuladas](https://www.postgresql.org/docs/18/monitoring-stats.html),
+[configuración de estadísticas](https://www.postgresql.org/docs/18/runtime-config-statistics.html)
 y [notas de PostgreSQL 18](https://www.postgresql.org/docs/18/release-18.html).
 
 # Mantenimiento de esta guía
