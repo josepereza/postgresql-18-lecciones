@@ -14,7 +14,7 @@ Edición: noviembre de 2026
 
 # Índice temático
 
-Actualización incluida: lecciones 30-39 sobre concurrencia, bloqueos,
+Actualización incluida: lecciones 30-40 sobre concurrencia, bloqueos,
 eventos, serialización, seguridad avanzada, observabilidad y mantenimiento. La
 numeración 20 no aparece en el historial disponible y no se inventa.
 
@@ -140,6 +140,8 @@ numeración 20 no aparece en el historial disponible y no se inventa.
 > [<u>Lección 38: Medir ANALYZE y detectar estadísticas desactualizadas</u>](#lección-38-medir-analyze-y-detectar-estadísticas-desactualizadas)
 >
 > [<u>Lección 39: E/S por sesión con pg_stat_get_backend_io()</u>](#lección-39-es-por-sesión-con-pg_stat_get_backend_io)
+>
+> [<u>Lección 40: WAL generado por sesión con pg_stat_get_backend_wal()</u>](#lección-40-wal-generado-por-sesión-con-pg_stat_get_backend_wal)
 
 # Arquitectura, administración y monitorización
 
@@ -2288,6 +2290,159 @@ servidor de producción solo para hacer una prueba.
   `read_bytes`, `write_bytes` y `extend_bytes`.
 
 Documentación oficial: [sistema de estadísticas acumuladas](https://www.postgresql.org/docs/18/monitoring-stats.html),
+[configuración de estadísticas](https://www.postgresql.org/docs/18/runtime-config-statistics.html)
+y [notas de PostgreSQL 18](https://www.postgresql.org/docs/18/release-18.html).
+
+## Lección 40 · WAL generado por sesión con pg_stat_get_backend_wal()
+
+[<u>↑ Volver al índice</u>](#índice-temático)
+
+### Idea principal
+
+WAL (*Write-Ahead Log*) registra los cambios antes de que las páginas de datos
+se escriban definitivamente. Hace posibles la recuperación tras fallos, la
+replicación y las copias físicas. `pg_stat_wal` ofrece datos de todo el clúster;
+PostgreSQL 18 añade `pg_stat_get_backend_wal(pid)` para saber cuánto WAL genera
+una sesión concreta.
+
+### Datos mínimos y ejemplo ejecutable
+
+```sql
+DROP TABLE IF EXISTS l40_lineas_pedido;
+DROP TABLE IF EXISTS l40_pedidos;
+
+CREATE TABLE l40_pedidos (
+    pedido_id  integer PRIMARY KEY,
+    cliente    text NOT NULL,
+    creado_en  timestamptz NOT NULL DEFAULT current_timestamp
+);
+
+CREATE TABLE l40_lineas_pedido (
+    pedido_id       integer NOT NULL REFERENCES l40_pedidos,
+    producto        text NOT NULL,
+    cantidad        integer NOT NULL CHECK (cantidad > 0),
+    precio_unitario numeric(10,2) NOT NULL CHECK (precio_unitario >= 0)
+);
+
+SELECT wal_records,
+       wal_fpi,
+       wal_bytes,
+       wal_buffers_full,
+       stats_reset
+FROM pg_stat_get_backend_wal(pg_backend_pid());
+```
+
+### Resultado esperado
+
+La función devuelve una fila. Los valores exactos dependen de todo lo ejecutado
+previamente por la conexión:
+
+| wal_records | wal_fpi | wal_bytes | wal_buffers_full | stats_reset |
+|---:|---:|---:|---:|---|
+| valor ≥ 0 | valor ≥ 0 | valor ≥ 0 | valor ≥ 0 | fecha/hora o NULL |
+
+Comprobación automática:
+
+```sql
+SELECT wal_records >= 0 AS registros_validos,
+       wal_fpi >= 0 AS fpi_validas,
+       wal_bytes >= 0 AS bytes_validos,
+       wal_buffers_full >= 0 AS buffers_validos
+FROM pg_stat_get_backend_wal(pg_backend_pid());
+```
+
+Resultado esperado: las cuatro columnas muestran `true`.
+
+### Ejercicio práctico
+
+Mide si una transacción que crea un pedido y sus líneas aumenta el WAL de tu
+sesión.
+
+### Solución explicada paso a paso
+
+1. Guarda los contadores actuales en una tabla temporal.
+
+```sql
+DROP TABLE IF EXISTS l40_wal_antes;
+
+CREATE TEMP TABLE l40_wal_antes AS
+SELECT wal_records, wal_fpi, wal_bytes, wal_buffers_full
+FROM pg_stat_get_backend_wal(pg_backend_pid());
+```
+
+2. Crea el pedido y sus líneas dentro de una sola transacción.
+
+```sql
+BEGIN;
+
+INSERT INTO l40_pedidos (pedido_id, cliente)
+VALUES (401, 'Ana');
+
+INSERT INTO l40_lineas_pedido
+    (pedido_id, producto, cantidad, precio_unitario)
+VALUES
+    (401, 'Teclado', 2, 79.00),
+    (401, 'Ratón',   1, 39.00);
+
+COMMIT;
+```
+
+3. Comprueba los datos de negocio.
+
+```sql
+SELECT p.pedido_id,
+       p.cliente,
+       SUM(l.cantidad * l.precio_unitario) AS total
+FROM l40_pedidos p
+JOIN l40_lineas_pedido l USING (pedido_id)
+GROUP BY p.pedido_id, p.cliente;
+```
+
+Resultado esperado:
+
+| pedido_id | cliente | total |
+|---:|---|---:|
+| 401 | Ana | 197.00 |
+
+4. Compara el WAL anterior y posterior.
+
+```sql
+WITH despues AS (
+    SELECT wal_records, wal_fpi, wal_bytes, wal_buffers_full
+    FROM pg_stat_get_backend_wal(pg_backend_pid())
+)
+SELECT d.wal_records - a.wal_records AS registros_nuevos,
+       d.wal_bytes - a.wal_bytes AS bytes_nuevos,
+       d.wal_fpi - a.wal_fpi AS fpi_nuevas,
+       d.wal_records > a.wal_records AS genero_wal
+FROM despues d
+CROSS JOIN l40_wal_antes a;
+```
+
+Resultado comprobable: `genero_wal = true`, con `registros_nuevos > 0` y
+`bytes_nuevos > 0`. `fpi_nuevas` puede ser cero: una imagen completa de página
+solo se genera cuando las reglas de protección de página lo requieren.
+
+### Buena práctica
+
+Una operación que genera mucho WAL también puede aumentar el uso de disco, el
+tráfico hacia réplicas y el volumen de archivado. Compara sesiones antes de
+optimizar y no reinicies sus estadísticas en producción sin un motivo claro.
+El WAL confirma cambios físicos registrados, pero no sustituye a medir tiempo,
+bloqueos y E/S.
+
+### PostgreSQL 18: novedad frente a concepto existente
+
+- WAL, `pg_stat_wal` y sus contadores ya existían.
+- PostgreSQL 18 incorpora `pg_stat_get_backend_wal(integer)`, que devuelve los
+  contadores WAL de un proceso concreto.
+- Las estadísticas de una sesión pueden reiniciarse con
+  `pg_stat_reset_backend_stats(integer)`; por defecto esta operación está
+  restringida a usuarios con privilegios elevados.
+- PostgreSQL 18 mueve el seguimiento de tiempos de E/S de WAL a las filas
+  `object = 'wal'` de `pg_stat_io`, controladas por `track_wal_io_timing`.
+
+Documentación oficial: [estadísticas acumuladas](https://www.postgresql.org/docs/18/monitoring-stats.html),
 [configuración de estadísticas](https://www.postgresql.org/docs/18/runtime-config-statistics.html)
 y [notas de PostgreSQL 18](https://www.postgresql.org/docs/18/release-18.html).
 
