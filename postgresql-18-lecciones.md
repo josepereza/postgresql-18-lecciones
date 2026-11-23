@@ -14,8 +14,8 @@ Edición: noviembre de 2026
 
 # Índice temático
 
-Actualización incluida: lecciones 30-40 sobre concurrencia, bloqueos,
-eventos, serialización, seguridad avanzada, observabilidad y mantenimiento. La
+Actualización incluida: lecciones 30-41 sobre concurrencia, bloqueos,
+eventos, serialización, seguridad avanzada, observabilidad, mantenimiento y SQL avanzado. La
 numeración 20 no aparece en el historial disponible y no se inventa.
 
 **Arquitectura, administración y monitorización**
@@ -51,6 +51,8 @@ numeración 20 no aparece en el historial disponible y no se inventa.
 >
 > [<u>Lección 29: CTE recursiva para
 > jerarquías</u>](#lección-29-cte-recursiva-para-jerarquías)
+>
+> [<u>Lección 41: Sincronizar inventario con MERGE ... RETURNING</u>](#lección-41-sincronizar-inventario-con-merge--returning)
 
 **Funciones de ventana**
 
@@ -628,6 +630,164 @@ suma el stock de todas las categorías alcanzadas.
 
 | **Versión:** Las CTE recursivas y CYCLE ya existían. PostgreSQL 18 mejora observabilidad de nodos relacionados en EXPLAIN. |
 |----------------------------------------------------------------------------------------------------------------------------|
+
+## Lección 41 · Sincronizar inventario con MERGE ... RETURNING
+
+[<u>↑ Volver al índice</u>](#índice-temático)
+
+### Idea principal
+
+`MERGE` compara una fuente con una tabla destino y decide, fila por fila, si
+debe insertar, actualizar, eliminar o no hacer nada. PostgreSQL 18 permite
+añadir `RETURNING`, usar `merge_action()` y consultar explícitamente los valores
+`OLD` y `NEW`. Así podemos sincronizar inventario y saber en la misma sentencia
+qué ocurrió.
+
+### Datos mínimos
+
+```sql
+DROP TABLE IF EXISTS l41_importacion;
+DROP TABLE IF EXISTS l41_productos;
+
+CREATE TABLE l41_productos (
+    sku     text PRIMARY KEY,
+    nombre  text NOT NULL,
+    precio  numeric(10,2) NOT NULL,
+    stock   integer NOT NULL CHECK (stock >= 0)
+);
+
+CREATE TABLE l41_importacion (
+    sku     text PRIMARY KEY,
+    nombre  text NOT NULL,
+    precio  numeric(10,2) NOT NULL,
+    stock   integer NOT NULL CHECK (stock >= 0)
+);
+
+INSERT INTO l41_productos VALUES
+    ('T-100', 'Teclado', 79.00, 5),
+    ('R-200', 'Ratón',   39.00, 10);
+
+INSERT INTO l41_importacion VALUES
+    ('T-100', 'Teclado mecánico', 89.00, 8),
+    ('M-300', 'Monitor 27',       249.00, 4);
+```
+
+### Ejemplo ejecutable
+
+```sql
+MERGE INTO l41_productos AS p
+USING l41_importacion AS i
+ON p.sku = i.sku
+WHEN MATCHED THEN
+    UPDATE SET nombre = i.nombre,
+               precio = i.precio,
+               stock = i.stock
+WHEN NOT MATCHED THEN
+    INSERT (sku, nombre, precio, stock)
+    VALUES (i.sku, i.nombre, i.precio, i.stock)
+RETURNING merge_action() AS accion,
+          new.sku,
+          old.precio AS precio_anterior,
+          new.precio AS precio_nuevo,
+          old.stock AS stock_anterior,
+          new.stock AS stock_nuevo;
+```
+
+### Resultado esperado
+
+El orden de las filas no está garantizado, pero el contenido será:
+
+| accion | sku | precio_anterior | precio_nuevo | stock_anterior | stock_nuevo |
+|---|---|---:|---:|---:|---:|
+| UPDATE | T-100 | 79.00 | 89.00 | 5 | 8 |
+| INSERT | M-300 | NULL | 249.00 | NULL | 4 |
+
+Para una inserción no existe una fila anterior, por eso los campos `OLD` son
+`NULL`.
+
+### Ejercicio práctico
+
+Recibe una segunda importación: el ratón desaparece del catálogo porque llega
+con stock cero, mientras que se incorpora un portátil nuevo. Resuélvelo con un
+solo `MERGE` y muestra la acción efectuada.
+
+### Solución explicada paso a paso
+
+1. Sustituye los datos de importación.
+
+```sql
+TRUNCATE l41_importacion;
+
+INSERT INTO l41_importacion VALUES
+    ('R-200', 'Ratón',    39.00, 0),
+    ('P-400', 'Portátil', 899.00, 2);
+```
+
+2. Coloca primero la condición específica que elimina stock cero. Las cláusulas
+`WHEN` se evalúan en el orden escrito y se ejecuta como máximo una acción por
+fila candidata.
+
+```sql
+MERGE INTO l41_productos AS p
+USING l41_importacion AS i
+ON p.sku = i.sku
+WHEN MATCHED AND i.stock = 0 THEN
+    DELETE
+WHEN MATCHED THEN
+    UPDATE SET nombre = i.nombre,
+               precio = i.precio,
+               stock = i.stock
+WHEN NOT MATCHED AND i.stock > 0 THEN
+    INSERT (sku, nombre, precio, stock)
+    VALUES (i.sku, i.nombre, i.precio, i.stock)
+RETURNING merge_action() AS accion,
+          COALESCE(old.sku, new.sku) AS sku,
+          old.stock AS stock_anterior,
+          new.stock AS stock_nuevo;
+```
+
+Resultado esperado, en cualquier orden:
+
+| accion | sku | stock_anterior | stock_nuevo |
+|---|---|---:|---:|
+| DELETE | R-200 | 10 | NULL |
+| INSERT | P-400 | NULL | 2 |
+
+3. Comprueba el inventario final.
+
+```sql
+SELECT sku, nombre, precio, stock
+FROM l41_productos
+ORDER BY sku;
+```
+
+Resultado esperado:
+
+| sku | nombre | precio | stock |
+|---|---|---:|---:|
+| M-300 | Monitor 27 | 249.00 | 4 |
+| P-400 | Portátil | 899.00 | 2 |
+| T-100 | Teclado mecánico | 89.00 | 8 |
+
+### Buena práctica
+
+Asegura que cada fila de la fuente coincida como máximo con una fila destino;
+una clave primaria en `sku` evita ambigüedades. No uses `MERGE` para ocultar
+reglas de negocio difíciles de revisar: mantén las condiciones específicas
+antes que las generales y prueba siempre los casos de inserción, actualización
+y eliminación.
+
+### PostgreSQL 18: novedad frente a concepto existente
+
+- `MERGE` ya existía en versiones anteriores de PostgreSQL.
+- PostgreSQL 18 añade `MERGE ... RETURNING` y `merge_action()`, que devuelve
+  `INSERT`, `UPDATE` o `DELETE` para cada fila procesada.
+- PostgreSQL 18 permite usar `OLD` y `NEW` explícitamente en `RETURNING` para
+  comparar el valor anterior con el nuevo.
+
+Documentación oficial: [MERGE](https://www.postgresql.org/docs/18/sql-merge.html),
+[funciones auxiliares de MERGE](https://www.postgresql.org/docs/18/functions-merge-support.html)
+y [RETURNING](https://www.postgresql.org/docs/18/dml-returning.html).
 
 # Funciones de ventana
 
