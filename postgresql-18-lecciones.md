@@ -14,7 +14,7 @@ Edición: noviembre de 2026
 
 # Índice temático
 
-Actualización incluida: lecciones 30-41 sobre concurrencia, bloqueos,
+Actualización incluida: lecciones 30-42 sobre concurrencia, bloqueos,
 eventos, serialización, seguridad avanzada, observabilidad, mantenimiento y SQL avanzado. La
 numeración 20 no aparece en el historial disponible y no se inventa.
 
@@ -80,6 +80,8 @@ numeración 20 no aparece en el historial disponible y no se inventa.
 >
 > [<u>Lección 22: Row-Level Security (RLS) en un
 > SaaS</u>](#lección-22-row-level-security-rls-en-un-saas)
+>
+> [<u>Lección 42: Permisos futuros con ALTER DEFAULT PRIVILEGES</u>](#lección-42-permisos-futuros-con-alter-default-privileges)
 
 **PL/pgSQL: funciones, procedimientos y triggers**
 
@@ -1106,6 +1108,163 @@ Usa otra política TO l22_tienda_2 con USING/WITH CHECK tienda_id=2.
 
 | **Versión:** RLS no es nuevo. PostgreSQL 18 añade OAuth y continúa la transición hacia autenticación más moderna; RLS sigue siendo autorización a nivel de filas. |
 |-------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+
+## Lección 42 · Permisos futuros con ALTER DEFAULT PRIVILEGES
+
+[<u>↑ Volver al índice</u>](#índice-temático)
+
+### Idea principal
+
+Un `GRANT` normal modifica objetos que ya existen. `ALTER DEFAULT PRIVILEGES`
+define qué permisos recibirán los objetos que un rol cree en el futuro. Es útil
+para que cada tabla nueva de la tienda sea legible por el grupo de informes sin
+tener que recordar un nuevo `GRANT` cada vez.
+
+Esta práctica requiere ejecutarse con un usuario que pueda crear roles. Los
+roles del ejemplo son `NOLOGIN`: representan un grupo y un usuario de prueba,
+pero no permiten conectarse.
+
+### Datos mínimos y ejemplo ejecutable
+
+```sql
+DO $bloque$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'l42_lectura') THEN
+        CREATE ROLE l42_lectura NOLOGIN;
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'l42_usuario') THEN
+        CREATE ROLE l42_usuario NOLOGIN;
+    END IF;
+END
+$bloque$;
+
+GRANT l42_lectura TO l42_usuario;
+
+DROP SCHEMA IF EXISTS l42_tienda CASCADE;
+CREATE SCHEMA l42_tienda;
+
+REVOKE ALL ON SCHEMA l42_tienda FROM PUBLIC;
+GRANT USAGE ON SCHEMA l42_tienda TO l42_lectura;
+
+-- Se crea antes de cambiar los privilegios predeterminados.
+CREATE TABLE l42_tienda.productos_antiguos (
+    producto_id integer PRIMARY KEY,
+    nombre      text NOT NULL
+);
+
+ALTER DEFAULT PRIVILEGES IN SCHEMA l42_tienda
+GRANT SELECT ON TABLES TO l42_lectura;
+
+-- Se crea después: recibirá SELECT automáticamente.
+CREATE TABLE l42_tienda.productos (
+    producto_id integer PRIMARY KEY,
+    nombre      text NOT NULL,
+    precio      numeric(10,2) NOT NULL
+);
+
+INSERT INTO l42_tienda.productos VALUES
+    (1, 'Monitor', 249.00),
+    (2, 'Teclado', 79.00);
+```
+
+Comprueba los permisos efectivos del usuario, incluida su pertenencia al rol de
+grupo:
+
+```sql
+SELECT has_schema_privilege(
+           'l42_usuario', 'l42_tienda', 'USAGE'
+       ) AS puede_usar_esquema,
+       has_table_privilege(
+           'l42_usuario', 'l42_tienda.productos_antiguos', 'SELECT'
+       ) AS lee_tabla_antigua,
+       has_table_privilege(
+           'l42_usuario', 'l42_tienda.productos', 'SELECT'
+       ) AS lee_tabla_nueva,
+       has_table_privilege(
+           'l42_usuario', 'l42_tienda.productos', 'INSERT'
+       ) AS puede_insertar;
+```
+
+### Resultado esperado
+
+| puede_usar_esquema | lee_tabla_antigua | lee_tabla_nueva | puede_insertar |
+|---|---|---|---|
+| true | false | true | false |
+
+La tabla antigua no cambia retroactivamente. La tabla nueva hereda `SELECT`,
+pero no `INSERT`, respetando el principio de mínimo privilegio.
+
+### Ejercicio práctico
+
+Concede lectura sobre las tablas que ya existían y verifica además que una
+tercera tabla creada después recibe el permiso predeterminado.
+
+### Solución explicada paso a paso
+
+1. Corrige los objetos existentes con un `GRANT` explícito.
+
+```sql
+GRANT SELECT ON ALL TABLES IN SCHEMA l42_tienda TO l42_lectura;
+```
+
+2. Crea otra tabla después de configurar los permisos predeterminados.
+
+```sql
+CREATE TABLE l42_tienda.pedidos (
+    pedido_id integer PRIMARY KEY,
+    total     numeric(10,2) NOT NULL
+);
+```
+
+3. Comprueba ambas tablas.
+
+```sql
+SELECT has_table_privilege(
+           'l42_usuario', 'l42_tienda.productos_antiguos', 'SELECT'
+       ) AS antigua_corregida,
+       has_table_privilege(
+           'l42_usuario', 'l42_tienda.pedidos', 'SELECT'
+       ) AS futura_automatica,
+       has_table_privilege(
+           'l42_usuario', 'l42_tienda.pedidos', 'UPDATE'
+       ) AS puede_actualizar;
+```
+
+Resultado esperado:
+
+| antigua_corregida | futura_automatica | puede_actualizar |
+|---|---|---|
+| true | true | false |
+
+### Buena práctica
+
+Concede permisos a roles de grupo (`l42_lectura`) y añade usuarios al grupo;
+evita repetir permisos usuario por usuario. Si las tablas las crea otro rol,
+configura sus valores predeterminados explícitamente con:
+
+```sql
+ALTER DEFAULT PRIVILEGES FOR ROLE rol_propietario
+IN SCHEMA l42_tienda
+GRANT SELECT ON TABLES TO l42_lectura;
+```
+
+El ejecutor debe ser ese propietario, un miembro autorizado del rol o un
+administrador con los privilegios necesarios.
+
+### PostgreSQL 18: novedad frente a concepto existente
+
+- `ALTER DEFAULT PRIVILEGES`, roles de grupo y `USAGE` sobre esquemas no son
+  novedades de PostgreSQL 18.
+- En PostgreSQL 18 sigue siendo esencial recordar que solo afecta a objetos
+  futuros y que los valores predeterminados del creador no se obtienen por
+  herencia desde otros roles.
+- `has_table_privilege()` y `has_schema_privilege()` permiten probar permisos
+  efectivos sin depender de la presentación de `\dp` en `psql`.
+
+Documentación oficial: [ALTER DEFAULT PRIVILEGES](https://www.postgresql.org/docs/18/sql-alterdefaultprivileges.html),
+[privilegios](https://www.postgresql.org/docs/18/ddl-priv.html)
+y [funciones de comprobación](https://www.postgresql.org/docs/18/functions-info.html).
 
 # PL/pgSQL: funciones, procedimientos y triggers
 
