@@ -14,7 +14,7 @@ Edición: noviembre de 2026
 
 # Índice temático
 
-Actualización incluida: lecciones 30-42 sobre concurrencia, bloqueos,
+Actualización incluida: lecciones 30-43 sobre concurrencia, bloqueos,
 eventos, serialización, seguridad avanzada, observabilidad, mantenimiento y SQL avanzado. La
 numeración 20 no aparece en el historial disponible y no se inventa.
 
@@ -92,6 +92,9 @@ numeración 20 no aparece en el historial disponible y no se inventa.
 >
 > [<u>Lección 12: Triggers para controlar el
 > stock</u>](#lección-12-triggers-para-controlar-el-stock)
+>
+> [<u>Lección 43: Triggers por sentencia con tablas de
+> transición</u>](#lección-43-triggers-por-sentencia-con-tablas-de-transición)
 
 **Funciones y modelado específicos de PostgreSQL 18**
 
@@ -1424,6 +1427,189 @@ RETURN OLD;
 | **Versión:** Triggers, NEW y OLD son funcionalidades anteriores a PostgreSQL 18. |
 |----------------------------------------------------------------------------------|
 
+## Lección 43 · Triggers por sentencia con tablas de transición
+
+[<u>↑ Volver al índice</u>](#índice-temático)
+
+### Objetivo
+
+Auditar una actualización masiva de existencias con **una sola fila de
+auditoría por sentencia SQL**, en vez de ejecutar una función una vez por cada
+producto modificado.
+
+### Repaso breve
+
+En la lección 12 usamos `FOR EACH ROW`: `OLD` y `NEW` representaban una fila.
+Ahora usaremos `FOR EACH STATEMENT` y dos **tablas de transición**:
+
+- `OLD TABLE`: todas las filas tal como estaban antes del `UPDATE`.
+- `NEW TABLE`: todas las filas tal como quedan después del `UPDATE`.
+
+La cláusula `REFERENCING` asigna nombres a esos conjuntos. Dentro de la función
+se consultan como tablas temporales de solo lectura.
+
+### Datos mínimos
+
+El bloque es independiente de las lecciones anteriores y puede ejecutarse
+completo en PostgreSQL 18:
+
+```sql
+DROP TABLE IF EXISTS l43_auditoria_stock;
+DROP TABLE IF EXISTS l43_productos;
+
+CREATE TABLE l43_productos (
+    producto_id integer PRIMARY KEY,
+    nombre text NOT NULL,
+    stock integer NOT NULL CHECK (stock >= 0)
+);
+
+CREATE TABLE l43_auditoria_stock (
+    auditoria_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    filas_afectadas integer NOT NULL,
+    cambio_total integer NOT NULL,
+    registrado_en timestamptz NOT NULL DEFAULT current_timestamp
+);
+
+INSERT INTO l43_productos (producto_id, nombre, stock) VALUES
+    (1, 'Teclado', 4),
+    (2, 'Ratón', 8),
+    (3, 'Monitor', 20);
+```
+
+### Función y trigger
+
+```sql
+CREATE OR REPLACE FUNCTION l43_registrar_actualizacion_stock()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    INSERT INTO l43_auditoria_stock (filas_afectadas, cambio_total)
+    SELECT count(*)::integer,
+           coalesce(sum(n.stock - o.stock), 0)::integer
+    FROM filas_anteriores AS o
+    JOIN filas_nuevas AS n USING (producto_id);
+
+    RETURN NULL;
+END;
+$$;
+
+CREATE TRIGGER l43_stock_actualizado
+AFTER UPDATE ON l43_productos
+REFERENCING OLD TABLE AS filas_anteriores
+            NEW TABLE AS filas_nuevas
+FOR EACH STATEMENT
+EXECUTE FUNCTION l43_registrar_actualizacion_stock();
+```
+
+`RETURN NULL` es adecuado porque PostgreSQL ignora el valor devuelto por un
+trigger `AFTER` por sentencia.
+
+### Prueba
+
+Una única sentencia cambia dos productos:
+
+```sql
+UPDATE l43_productos
+SET stock = stock + 5
+WHERE producto_id IN (1, 2);
+
+SELECT producto_id, nombre, stock
+FROM l43_productos
+ORDER BY producto_id;
+
+SELECT auditoria_id, filas_afectadas, cambio_total
+FROM l43_auditoria_stock
+ORDER BY auditoria_id;
+```
+
+Resultados esperados:
+
+| producto_id | nombre | stock |
+|---:|---|---:|
+| 1 | Teclado | 9 |
+| 2 | Ratón | 13 |
+| 3 | Monitor | 20 |
+
+| auditoria_id | filas_afectadas | cambio_total |
+|---:|---:|---:|
+| 1 | 2 | 10 |
+
+Hay una sola fila de auditoría: el trigger vio las dos filas del `UPDATE` como
+un conjunto y sumó `(9 - 4) + (13 - 8) = 10`.
+
+### Ejercicio práctico
+
+Incrementa en 3 unidades el stock de todos los productos cuyo stock actual sea
+menor que 10. Después, comprueba la auditoría completa.
+
+### Solución paso a paso
+
+1. Tras la primera prueba, solo `Teclado` tiene stock menor que 10.
+2. La siguiente sentencia modifica ese producto, de 9 a 12:
+
+```sql
+UPDATE l43_productos
+SET stock = stock + 3
+WHERE stock < 10;
+```
+
+3. Consulta el estado final y las dos operaciones auditadas:
+
+```sql
+SELECT producto_id, nombre, stock
+FROM l43_productos
+ORDER BY producto_id;
+
+SELECT auditoria_id, filas_afectadas, cambio_total
+FROM l43_auditoria_stock
+ORDER BY auditoria_id;
+```
+
+Resultados esperados:
+
+| producto_id | nombre | stock |
+|---:|---|---:|
+| 1 | Teclado | 12 |
+| 2 | Ratón | 13 |
+| 3 | Monitor | 20 |
+
+| auditoria_id | filas_afectadas | cambio_total |
+|---:|---:|---:|
+| 1 | 2 | 10 |
+| 2 | 1 | 3 |
+
+### Matiz y buena práctica
+
+Un trigger `FOR EACH STATEMENT` también se ejecuta si la sentencia no modifica
+ninguna fila. Esta función registraría entonces `0` filas y un cambio total de
+`0`. Para omitir ese registro, añade al principio del cuerpo:
+
+```sql
+IF NOT EXISTS (SELECT FROM filas_nuevas) THEN
+    RETURN NULL;
+END IF;
+```
+
+Las tablas de transición requieren un trigger `AFTER` sobre una tabla ordinaria;
+en un trigger de `UPDATE` con `REFERENCING` no se admite una lista `UPDATE OF
+columna`. Mantén ligera la función: su trabajo forma parte de la misma
+transacción y prolonga su duración.
+
+### PostgreSQL 18: novedad frente a concepto existente
+
+- Los triggers por sentencia y las tablas de transición **no son novedades de
+  PostgreSQL 18**; ya estaban documentados en PostgreSQL 10.
+- PostgreSQL 18 conserva `REFERENCING OLD TABLE` y `NEW TABLE` para que un
+  trigger vea el conjunto completo afectado.
+- No debe confundirse esto con `RETURNING old.columna` y `new.columna`, ampliado
+  en PostgreSQL 18: aquí `OLD TABLE` y `NEW TABLE` pertenecen a la definición
+  del trigger.
+
+Documentación oficial: [CREATE TRIGGER](https://www.postgresql.org/docs/18/sql-createtrigger.html),
+[comportamiento de los triggers](https://www.postgresql.org/docs/18/trigger-definition.html)
+y [funciones trigger en PL/pgSQL](https://www.postgresql.org/docs/18/plpgsql-trigger.html).
+
 # Funciones y modelado específicos de PostgreSQL 18
 
 Este bloque agrupa las lecciones relacionadas para estudiar el tema de
@@ -1777,7 +1963,7 @@ Orden sugerido si quieres repetir el curso desde cero:
 
 **Seguridad:** Lección 9, Lección 22
 
-**PL/pgSQL:** Lección 10, Lección 11, Lección 12
+**PL/pgSQL:** Lección 10, Lección 11, Lección 12, Lección 43
 
 **Administración:** Lección 1, Lección 13, Lección 14, Lección 15,
 Lección 23
