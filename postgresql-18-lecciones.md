@@ -14,7 +14,7 @@ Edición: noviembre de 2026
 
 # Índice temático
 
-Actualización incluida: lecciones 30-43 sobre concurrencia, bloqueos,
+Actualización incluida: lecciones 30-44 sobre concurrencia, bloqueos,
 eventos, serialización, seguridad avanzada, observabilidad, mantenimiento y SQL avanzado. La
 numeración 20 no aparece en el historial disponible y no se inventa.
 
@@ -72,6 +72,8 @@ numeración 20 no aparece en el historial disponible y no se inventa.
 >
 > [<u>Lección 21: EXPLAIN ANALYZE: estimado vs
 > real</u>](#lección-21-explain-analyze-estimado-vs-real)
+>
+> [<u>Lección 44: Índices parciales y consultas cubiertas</u>](#lección-44-índices-parciales-y-consultas-cubiertas)
 
 **Roles, permisos y seguridad**
 
@@ -1023,6 +1025,168 @@ usar el mismo índice multicolumna.
 | **Versión:** PostgreSQL 18 mejora la observabilidad de EXPLAIN, incluida información adicional de memoria y búsquedas en índices. |
 |-----------------------------------------------------------------------------------------------------------------------------------|
 
+## Lección 44 · Índices parciales y consultas cubiertas
+
+[<u>↑ Volver al índice</u>](#índice-temático)
+
+### Objetivo
+
+Acelerar la consulta frecuente de pedidos pendientes sin mantener un índice
+para los miles de pedidos ya entregados. Combinaremos:
+
+- un **índice parcial**, que guarda únicamente las filas interesantes;
+- `INCLUDE`, que añade columnas de salida sin convertirlas en claves de
+  búsqueda;
+- `EXPLAIN (ANALYZE, BUFFERS)`, para comprobar el plan real.
+
+### Datos mínimos reproducibles
+
+```sql
+DROP TABLE IF EXISTS l44_pedidos;
+
+CREATE TABLE l44_pedidos (
+    pedido_id integer PRIMARY KEY,
+    creado_en timestamp NOT NULL,
+    estado text NOT NULL
+        CHECK (estado IN ('pendiente', 'pagado', 'entregado')),
+    total numeric(10,2) NOT NULL
+);
+
+INSERT INTO l44_pedidos (pedido_id, creado_en, estado, total)
+SELECT g,
+       timestamp '2026-01-01 00:00' + g * interval '1 minute',
+       CASE
+           WHEN g > 9990 THEN 'pendiente'
+           WHEN g > 9900 THEN 'pagado'
+           ELSE 'entregado'
+       END,
+       (g / 100.0)::numeric(10,2)
+FROM generate_series(1, 10000) AS g;
+
+ANALYZE l44_pedidos;
+```
+
+La tabla contiene 10 pedidos pendientes, 90 pagados y 9900 entregados.
+
+### Crear el índice parcial
+
+```sql
+CREATE INDEX l44_pedidos_pendientes_fecha_idx
+ON l44_pedidos (creado_en DESC)
+INCLUDE (pedido_id, total)
+WHERE estado = 'pendiente';
+
+VACUUM (ANALYZE) l44_pedidos;
+```
+
+El índice solo contiene las 10 filas pendientes. `creado_en DESC` ayuda con el
+orden y `INCLUDE` guarda `pedido_id` y `total` para que PostgreSQL pueda
+resolver la consulta usando únicamente el índice cuando el mapa de visibilidad
+lo permita.
+
+### Comprobar el plan
+
+```sql
+EXPLAIN (ANALYZE, BUFFERS, COSTS OFF, SUMMARY OFF)
+SELECT pedido_id, creado_en, total
+FROM l44_pedidos
+WHERE estado = 'pendiente'
+ORDER BY creado_en DESC
+LIMIT 3;
+```
+
+Fragmento esperado del plan; los tiempos y buffers exactos pueden variar:
+
+```text
+Limit
+  ->  Index Only Scan using l44_pedidos_pendientes_fecha_idx
+        on l44_pedidos
+        Heap Fetches: 0
+```
+
+Comprueba también el resultado:
+
+```sql
+SELECT pedido_id, creado_en, total
+FROM l44_pedidos
+WHERE estado = 'pendiente'
+ORDER BY creado_en DESC
+LIMIT 3;
+```
+
+| pedido_id | creado_en | total |
+|---:|---|---:|
+| 10000 | 2026-01-07 22:40:00 | 100.00 |
+| 9999 | 2026-01-07 22:39:00 | 99.99 |
+| 9998 | 2026-01-07 22:38:00 | 99.98 |
+
+### Ejercicio práctico
+
+Crea otro índice parcial para obtener rápidamente los dos pedidos pagados más
+recientes. La consulta debe devolver `pedido_id`, `creado_en` y `total` sin
+necesitar esas tres columnas como claves de búsqueda.
+
+### Solución paso a paso
+
+1. Usa `creado_en` como clave porque filtra el orden y el límite.
+2. Incluye las columnas que solo se devuelven.
+3. Repite exactamente el predicado de la consulta.
+
+```sql
+CREATE INDEX l44_pedidos_pagados_fecha_idx
+ON l44_pedidos (creado_en DESC)
+INCLUDE (pedido_id, total)
+WHERE estado = 'pagado';
+
+VACUUM (ANALYZE) l44_pedidos;
+
+EXPLAIN (ANALYZE, BUFFERS, COSTS OFF, SUMMARY OFF)
+SELECT pedido_id, creado_en, total
+FROM l44_pedidos
+WHERE estado = 'pagado'
+ORDER BY creado_en DESC
+LIMIT 2;
+
+SELECT pedido_id, creado_en, total
+FROM l44_pedidos
+WHERE estado = 'pagado'
+ORDER BY creado_en DESC
+LIMIT 2;
+```
+
+Resultado esperado:
+
+| pedido_id | creado_en | total |
+|---:|---|---:|
+| 9990 | 2026-01-07 22:30:00 | 99.90 |
+| 9989 | 2026-01-07 22:29:00 | 99.89 |
+
+### Matices y buenas prácticas
+
+- PostgreSQL solo puede usar un índice parcial si reconoce que el `WHERE` de
+  la consulta implica el predicado del índice. Escribe el predicado de forma
+  coherente.
+- Una consulta preparada con un parámetro genérico como `estado = $1` puede no
+  demostrar durante la planificación que necesita el subconjunto del índice.
+- `INCLUDE` puede evitar accesos a la tabla, pero aumenta el tamaño del índice.
+  No incluyas columnas anchas sin medir.
+- `VACUUM` se usa aquí para favorecer un `Index Only Scan` reproducible. En una
+  tabla con muchas escrituras puede haber `Heap Fetches` mayores que cero.
+- No desactives `enable_seqscan` como solución permanente: deja que el
+  planificador compare costes y revisa estadísticas y selectividad.
+
+### PostgreSQL 18: novedad frente a concepto existente
+
+- Los índices parciales son anteriores a PostgreSQL 18; ya aparecían en la
+  documentación de PostgreSQL 10.
+- `INCLUDE` se incorporó en PostgreSQL 11, no en PostgreSQL 18.
+- PostgreSQL 18 mantiene estas capacidades y permite verificar su uso con
+  `EXPLAIN`; la elección concreta del plan depende de los datos y estadísticas.
+
+Documentación oficial: [índices parciales](https://www.postgresql.org/docs/18/indexes-partial.html),
+[consultas cubiertas e Index Only Scan](https://www.postgresql.org/docs/18/indexes-index-only-scans.html)
+y [uso de EXPLAIN](https://www.postgresql.org/docs/18/using-explain.html).
+
 # Roles, permisos y seguridad
 
 Este bloque agrupa las lecciones relacionadas para estudiar el tema de
@@ -1959,7 +2123,7 @@ Orden sugerido si quieres repetir el curso desde cero:
 
 **Ventanas:** Lección 6, Lección 7, Lección 24
 
-**Rendimiento:** Lección 8, Lección 21
+**Rendimiento:** Lección 8, Lección 21, Lección 44
 
 **Seguridad:** Lección 9, Lección 22
 
