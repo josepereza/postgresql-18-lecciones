@@ -14,7 +14,7 @@ Edición: noviembre de 2026
 
 # Índice temático
 
-Actualización incluida: lecciones 30-44 sobre concurrencia, bloqueos,
+Actualización incluida: lecciones 30-45 sobre concurrencia, bloqueos,
 eventos, serialización, seguridad avanzada, observabilidad, mantenimiento y SQL avanzado. La
 numeración 20 no aparece en el historial disponible y no se inventa.
 
@@ -64,6 +64,8 @@ numeración 20 no aparece en el historial disponible y no se inventa.
 >
 > [<u>Lección 24: Marcos GROUPS y
 > EXCLUDE</u>](#lección-24-marcos-groups-y-exclude)
+>
+> [<u>Lección 45: Ventanas móviles por tiempo con RANGE</u>](#lección-45-ventanas-móviles-por-tiempo-con-range)
 
 **Índices, EXPLAIN y rendimiento**
 
@@ -929,6 +931,156 @@ fila física anterior.
 
 | **Versión:** GROUPS y EXCLUDE existen desde antes; PostgreSQL 18 mejora rendimiento/observabilidad de algunos agregados de ventana. |
 |-------------------------------------------------------------------------------------------------------------------------------------|
+
+## Lección 45 · Ventanas móviles por tiempo con RANGE
+
+[<u>↑ Volver al índice</u>](#índice-temático)
+
+### Objetivo
+
+Calcular las ventas de los últimos siete días naturales aunque existan días
+sin pedidos. La diferencia esencial es:
+
+- `ROWS` cuenta filas físicas anteriores.
+- `RANGE` compara el valor de ordenación, en este caso una fecha.
+
+### Datos mínimos
+
+La tabla es independiente de las lecciones anteriores. Hay huecos entre las
+fechas precisamente para que la diferencia resulte visible.
+
+```sql
+DROP TABLE IF EXISTS l45_pedidos;
+
+CREATE TABLE l45_pedidos (
+    pedido_id integer PRIMARY KEY,
+    fecha timestamp NOT NULL,
+    total numeric(10,2) NOT NULL CHECK (total >= 0)
+);
+
+INSERT INTO l45_pedidos (pedido_id, fecha, total) VALUES
+    (1, '2026-11-01 10:00', 100.00),
+    (2, '2026-11-02 11:00',  50.00),
+    (3, '2026-11-05 12:00', 200.00),
+    (4, '2026-11-10 09:00',  80.00),
+    (5, '2026-11-11 14:00', 120.00);
+```
+
+### Ventana de siete días naturales
+
+Primero agregamos por día; después aplicamos la función de ventana. Para
+incluir el día actual y los seis anteriores usamos `INTERVAL '6 days'`.
+
+```sql
+WITH ventas_diarias AS (
+    SELECT date_trunc('day', fecha) AS dia,
+           sum(total) AS total_dia
+    FROM l45_pedidos
+    GROUP BY date_trunc('day', fecha)
+)
+SELECT dia::date,
+       total_dia,
+       sum(total_dia) OVER (
+           ORDER BY dia
+           RANGE BETWEEN INTERVAL '6 days' PRECEDING
+                     AND CURRENT ROW
+       ) AS total_7_dias
+FROM ventas_diarias
+ORDER BY dia;
+```
+
+Resultado esperado:
+
+| dia | total_dia | total_7_dias |
+|---|---:|---:|
+| 2026-11-01 | 100.00 | 100.00 |
+| 2026-11-02 | 50.00 | 150.00 |
+| 2026-11-05 | 200.00 | 350.00 |
+| 2026-11-10 | 80.00 | 280.00 |
+| 2026-11-11 | 120.00 | 400.00 |
+
+Para el 10 de noviembre, el marco empieza el día 4: entran las ventas del 5 y
+del 10, pero ya no las del 1 ni las del 2. `RANGE` utiliza la distancia
+temporal, no el número de filas disponibles.
+
+### Ejercicio práctico
+
+Calcula, para cada fecha:
+
+1. las ventas de los últimos **tres días naturales**;
+2. las ventas de las últimas **tres filas con ventas**.
+
+Compara especialmente el resultado del 10 de noviembre.
+
+### Solución paso a paso
+
+1. Tres días naturales significan el día actual más dos días anteriores:
+   `RANGE ... INTERVAL '2 days' PRECEDING`.
+2. Tres filas significan la fila actual y las dos anteriores:
+   `ROWS ... 2 PRECEDING`.
+3. Ambas ventanas pueden calcularse en la misma consulta.
+
+```sql
+WITH ventas_diarias AS (
+    SELECT date_trunc('day', fecha) AS dia,
+           sum(total) AS total_dia
+    FROM l45_pedidos
+    GROUP BY date_trunc('day', fecha)
+)
+SELECT dia::date,
+       total_dia,
+       sum(total_dia) OVER (
+           ORDER BY dia
+           RANGE BETWEEN INTERVAL '2 days' PRECEDING
+                     AND CURRENT ROW
+       ) AS ultimos_3_dias,
+       sum(total_dia) OVER (
+           ORDER BY dia
+           ROWS BETWEEN 2 PRECEDING AND CURRENT ROW
+       ) AS ultimas_3_filas
+FROM ventas_diarias
+ORDER BY dia;
+```
+
+Resultado esperado:
+
+| dia | total_dia | ultimos_3_dias | ultimas_3_filas |
+|---|---:|---:|---:|
+| 2026-11-01 | 100.00 | 100.00 | 100.00 |
+| 2026-11-02 | 50.00 | 150.00 | 150.00 |
+| 2026-11-05 | 200.00 | 200.00 | 350.00 |
+| 2026-11-10 | 80.00 | 80.00 | 330.00 |
+| 2026-11-11 | 120.00 | 200.00 | 400.00 |
+
+El 10 de noviembre no hubo ventas el 8 ni el 9, por lo que el total natural de
+tres días es solo `80`. En cambio, `ROWS` retrocede hasta las filas del 5 y del
+2 de noviembre y obtiene `50 + 200 + 80 = 330`.
+
+### Matices y buenas prácticas
+
+- Agrega primero por día si puede haber varios pedidos en una misma fecha. Así
+  evitas tratar cada pedido como si fuera un día distinto.
+- Con un desplazamiento, `RANGE` exige exactamente una expresión en el
+  `ORDER BY` de la ventana.
+- Para columnas `date` o `timestamp`, el desplazamiento de `RANGE` se expresa
+  normalmente como `interval`.
+- Decide si “últimos siete días” incluye el día actual: en ese caso el límite
+  inferior es seis días antes, no siete.
+- Para informes grandes, un índice sobre `fecha` puede ayudar a filtrar el
+  periodo inicial, aunque la agregación y la ventana todavía requieren trabajo.
+
+### PostgreSQL 18: novedad frente a concepto existente
+
+- Las funciones de ventana no son nuevas en PostgreSQL 18.
+- Los desplazamientos `RANGE ... PRECEDING/FOLLOWING`, `GROUPS` y las opciones
+  `EXCLUDE` se incorporaron en PostgreSQL 11 como parte del soporte de marcos
+  definido por SQL:2011.
+- PostgreSQL 18 conserva esta sintaxis; para ordenar por fechas o marcas de
+  tiempo, la documentación admite un `interval` como desplazamiento.
+
+Documentación oficial: [expresiones y marcos de ventana](https://www.postgresql.org/docs/18/sql-expressions.html),
+[funciones de ventana](https://www.postgresql.org/docs/18/functions-window.html)
+y [novedades de PostgreSQL 11](https://www.postgresql.org/docs/11/release-11.html).
 
 # Índices, EXPLAIN y rendimiento
 
@@ -2121,7 +2273,7 @@ Orden sugerido si quieres repetir el curso desde cero:
 
 **Fundamentos SQL:** Lección 2, Lección 3, Lección 4, Lección 5
 
-**Ventanas:** Lección 6, Lección 7, Lección 24
+**Ventanas:** Lección 6, Lección 7, Lección 24, Lección 45
 
 **Rendimiento:** Lección 8, Lección 21, Lección 44
 
